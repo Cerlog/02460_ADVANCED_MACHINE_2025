@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.distributions as td
 from tqdm import tqdm
-
+import os 
 class GaussianBase(nn.Module):
     def __init__(self, D):
         """
@@ -116,8 +116,8 @@ class MaskedCouplingLayer(nn.Module):
 
         # split the input 
 
-        x_a = x * self.mask
-        x_b = x * (1 - self.mask)
+        x_a = z * self.mask
+        x_b = z * (1 - self.mask)
 
         # compute scale and translation parameters 
         s = self.scale_net(x_a)
@@ -301,28 +301,70 @@ def train(model, optimizer, data_loader, epochs, device):
     """
     model.train()
 
-    total_steps = len(data_loader)*epochs
+    total_steps = len(data_loader) * epochs
     progress_bar = tqdm(range(total_steps), desc="Training")
-
+    losses = []
     for epoch in range(epochs):
+        epoch_losses  = []
         data_iter = iter(data_loader)
-        for x in data_iter:
-            x = x.to(device)
+        for batch in data_iter:
+            x = batch[0].to(device)  # Extract the images from (images, labels)
             optimizer.zero_grad()
             loss = model.loss(x)
             loss.backward()
             optimizer.step()
 
+
+            epoch_losses.append(loss.item())
             # Update progress bar
-            progress_bar.set_postfix(loss=f"⠀{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}")
+            progress_bar.set_postfix(loss=f"{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}")
             progress_bar.update()
 
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        losses.append(avg_loss)
+        progress_bar.set_postfix(loss=f"{avg_loss:12.4f}", epoch=f"{epoch+1}/{epochs}")
+
+    return losses
+
+
+def create_random_mask(D):
+    """Create a random binary mask of size D"""
+    return torch.randint(0, 2, (D,)).float()
+
+def create_checkerboard_mask(height, width):
+    """Create a checkerboard mask for a flattened image of size height x width"""
+    mask = torch.zeros(height, width)
+    for i in range(height):
+        for j in range(width):
+            mask[i, j] = (i + j) % 2
+    return mask.view(-1)  # Flatten to 1D
+
+def plot_samples(model, device, num_samples=25, nrow=5):
+    """Generate and plot samples from the model"""
+    model.eval()
+    with torch.no_grad():
+        samples = model.sample((num_samples,)).to('cpu')
+    
+    # Reshape samples to images
+    samples = samples.view(-1, 28, 28)
+    
+    # Create plot
+    fig, axes = plt.subplots(nrow, nrow, figsize=(8, 8))
+    for i, ax in enumerate(axes.flatten()):
+        if i < num_samples:
+            ax.imshow(samples[i], cmap='gray')
+        ax.axis('off')
+    
+    plt.tight_layout()
+    return fig
 
 if __name__ == "__main__":
     import torch.utils.data
     from torchvision import datasets, transforms
     from torchvision.utils import save_image
     import ToyData
+
+    
 
     # Parse arguments
     import argparse
@@ -335,74 +377,174 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=10000, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='V', help='learning rate for training (default: %(default)s)')
+    parser.add_argument('--num-layers', type=int, default=5, metavar='N', help='number of coupling layers in the flow (default: %(default)s)')
+    parser.add_argument('--hidden-dim', type=int, default=256, metavar='N', help='dimension of hidden layers in the coupling layers (default: %(default)s)')
+
 
     args = parser.parse_args()
     print('# Options')
     for key, value in sorted(vars(args).items()):
         print(key, '=', value)
 
-    # Generate the data
-    n_data = 10000000
-    toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
-    train_loader = torch.utils.data.DataLoader(toy().sample((n_data,)), batch_size=args.batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(toy().sample((n_data,)), batch_size=args.batch_size, shuffle=True)
 
-    # Define prior distribution
-    D = next(iter(train_loader)).shape[1]
+    device = torch.device(args.device)
+    ############################################################################
+    # Data: Dequantized MNIST
+    ############################################################################
+    transform_mnist = transforms.Compose([
+        transforms.ToTensor(),                            # shape (1,28,28), range [0,1]
+        transforms.Lambda(lambda x: x + torch.rand_like(x)/256.0),  # dequantize
+        transforms.Lambda(lambda x: x.clamp(0.0, 1.0)),   # ensure still in [0,1]
+        transforms.Lambda(lambda x: x.view(-1))           # flatten to (784,)
+    ])
+    train_dataset = datasets.MNIST(root='data', train=True, download=True,
+                                   transform=transform_mnist)
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=args.batch_size,
+                                               shuffle=True)
+
+    D = 784  # flattened MNIST
+
+    ############################################################################
+    # Build the Flow Model
+    ############################################################################
+    # 1) Base distribution
     base = GaussianBase(D)
 
-    # Define transformations
-    transformations =[]
-    mask = torch.Tensor([1 if (i+j) % 2 == 0 else 0 for i in range(28) for j in range(28)])
-    
-    num_transformations = 5
-    num_hidden = 8
+    # 2) Checkerboard mask for 28x28
+    #    We'll alternate it across layers to transform all pixels eventually.
+    mask2d = torch.zeros((28,28))
+    for i in range(28):
+        for j in range(28):
+            if (i + j) % 2 == 0:
+                mask2d[i, j] = 1.0
+    mask_checkerboard = mask2d.view(-1)  # shape (784,)
 
-    # Make a mask that is 1 for the first half of the features and 0 for the second half
-    mask = torch.zeros((D,))
-    mask[D//2:] = 1
-    
-    for i in range(num_transformations):
-        mask = (1-mask) # Flip the mask
-        scale_net = nn.Sequential(nn.Linear(D, num_hidden), nn.ReLU(), nn.Linear(num_hidden, D))
-        translation_net = nn.Sequential(nn.Linear(D, num_hidden), nn.ReLU(), nn.Linear(num_hidden, D))
-        transformations.append(MaskedCouplingLayer(scale_net, translation_net, mask))
+    # 3) Create coupling layers
+    transformations = []
+    for i in range(args.num_layers):
+        # Flip checkerboard every other layer
+        if i % 2 == 0:
+            current_mask = mask_checkerboard
+        else:
+            current_mask = 1.0 - mask_checkerboard
 
-    # Define flow model
-    model = Flow(base, transformations).to(args.device)
+        # Scale net with tanh at the end
+        scale_net = nn.Sequential(
+            nn.Linear(D, args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(args.hidden_dim, args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(args.hidden_dim, D),
+            nn.Tanh()  # ensures log-scale is in (-1,1)
+        )
+        # Translation net (no tanh needed)
+        translation_net = nn.Sequential(
+            nn.Linear(D, args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(args.hidden_dim, args.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(args.hidden_dim, D)
+        )
 
-    # Choose mode to run
+        transformations.append(MaskedCouplingLayer(scale_net, translation_net, current_mask))
+
+    # 4) Flow model
+    model = Flow(base, transformations).to(device)
+
+    ############################################################################
+    # Run: Train or Sample
+    ############################################################################
     if args.mode == 'train':
-        # Define optimizer
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        train(model, optimizer, train_loader, args.epochs, device)
 
-        # Train model
-        train(model, optimizer, train_loader, args.epochs, args.device)
-
-        # Save model
+        print(f"Saving model to {args.model} ...")
         torch.save(model.state_dict(), args.model)
 
     elif args.mode == 'sample':
-        import matplotlib.pyplot as plt
-        import numpy as np
+        # Load the trained model
+        if not os.path.isfile(args.model):
+            raise FileNotFoundError(f"No model file found at {args.model}")
 
-        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        print(f"Loading model from {args.model} ...")
+        model.load_state_dict(torch.load(args.model, map_location=device))
+        model.eval()
 
         # Generate samples
-        model.eval()
+        print("Generating samples from the flow ...")
         with torch.no_grad():
-            samples = (model.sample((10000,))).cpu() 
+            samples = model.sample((64,)).cpu()  # 64 samples
 
-        # Plot the density of the toy data and the model samples
-        coordinates = [[[x,y] for x in np.linspace(*toy.xlim, 1000)] for y in np.linspace(*toy.ylim, 1000)]
-        prob = torch.exp(toy().log_prob(torch.tensor(coordinates)))
+        # Reshape to (64, 1, 28, 28) for saving as image grid
+        samples = samples.clamp(0,1).view(-1, 1, 28, 28)
+        print(f"Saving samples to {args.samples} ...")
+        save_image(samples, args.samples, nrow=8)
+        print("Done.")
 
-        fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-        im = ax.imshow(prob, extent=[toy.xlim[0], toy.xlim[1], toy.ylim[0], toy.ylim[1]], origin='lower', cmap='YlOrRd')
-        ax.scatter(samples[:, 0], samples[:, 1], s=1, c='black', alpha=0.5)
-        ax.set_xlim(toy.xlim)
-        ax.set_ylim(toy.ylim)
-        ax.set_aspect('equal')
-        fig.colorbar(im)
-        plt.savefig(args.samples)
-        plt.close()
+
+#    # Generate the data
+#    n_data = 10000000
+#    toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
+#    train_loader = torch.utils.data.DataLoader(toy().sample((n_data,)), batch_size=args.batch_size, shuffle=True)
+#    test_loader = torch.utils.data.DataLoader(toy().sample((n_data,)), batch_size=args.batch_size, shuffle=True)
+#
+#    # Define prior distribution
+#    D = next(iter(train_loader)).shape[1]
+#    base = GaussianBase(D)
+#
+#    # Define transformations
+#    transformations =[]
+#    mask = torch.Tensor([1 if (i+j) % 2 == 0 else 0 for i in range(28) for j in range(28)])
+#    
+#    num_transformations = 5
+#    num_hidden = 8
+#
+#    # Make a mask that is 1 for the first half of the features and 0 for the second half
+#    mask = torch.zeros((D,))
+#    mask[D//2:] = 1
+#    
+#    for i in range(num_transformations):
+#        mask = (1-mask) # Flip the mask
+#        scale_net = nn.Sequential(nn.Linear(D, num_hidden), nn.ReLU(), nn.Linear(num_hidden, D))
+#        translation_net = nn.Sequential(nn.Linear(D, num_hidden), nn.ReLU(), nn.Linear(num_hidden, D))
+#        transformations.append(MaskedCouplingLayer(scale_net, translation_net, mask))
+#
+#    # Define flow model
+#    model = Flow(base, transformations).to(args.device)
+#
+#    # Choose mode to run
+#    if args.mode == 'train':
+#        # Define optimizer
+#        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+#
+#        # Train model
+#        train(model, optimizer, train_loader, args.epochs, args.device)
+#
+#        # Save model
+#        torch.save(model.state_dict(), args.model)
+#
+#    elif args.mode == 'sample':
+#        import matplotlib.pyplot as plt
+#        import numpy as np
+#
+#        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+#
+#        # Generate samples
+#        model.eval()
+#        with torch.no_grad():
+#            samples = (model.sample((10000,))).cpu() 
+#
+#        # Plot the density of the toy data and the model samples
+#        coordinates = [[[x,y] for x in np.linspace(*toy.xlim, 1000)] for y in np.linspace(*toy.ylim, 1000)]
+#        prob = torch.exp(toy().log_prob(torch.tensor(coordinates)))
+#
+#        fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+#        im = ax.imshow(prob, extent=[toy.xlim[0], toy.xlim[1], toy.ylim[0], toy.ylim[1]], origin='lower', cmap='YlOrRd')
+#        ax.scatter(samples[:, 0], samples[:, 1], s=1, c='black', alpha=0.5)
+#        ax.set_xlim(toy.xlim)
+#        ax.set_ylim(toy.ylim)
+#        ax.set_aspect('equal')
+#        fig.colorbar(im)
+#        plt.savefig(args.samples)
+#        plt.close()
